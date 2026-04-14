@@ -31,3 +31,22 @@ python camera_preview.py --cams 0 1
 ```bash
 python view_demo.py --file data/demo.parquet --play
 ```
+
+## Calibrate
+```
+lerobot-calibrate \
+  --robot.type=so101_follower \
+  --robot.port=/dev/cu.usbmodem5AE60846081 \
+  --robot.id=arm2
+```
+Note that
+```
+PORT1 = "/dev/cu.usbmodem5AE60581371"  # RHS arm named arm1
+PORT2 = "/dev/cu.usbmodem5AE60846081"  # LHS arm named arm2
+```
+The calibration files are also called arm1, arm2.json
+
+## Using a policy on the two arms:
+```
+python path-to/test_policy.py
+```

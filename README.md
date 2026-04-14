@@ -46,7 +46,7 @@ PORT2 = "/dev/cu.usbmodem5AE60846081"  # LHS arm named arm2
 ```
 The calibration files are also called arm1, arm2.json
 
-## Using a policy on the two arms:
+## Using a policy on the two arms (the ACT):
 ```
 python path-to/test_policy.py
 ```

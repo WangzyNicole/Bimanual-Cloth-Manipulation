@@ -1,0 +1,7 @@
+scservo_sdk
+opencv-python
+pyarrow
+pandas
+lerobot==0.5.0
+datasets==3.5.1
+torch

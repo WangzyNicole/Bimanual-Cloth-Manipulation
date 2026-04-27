@@ -12,7 +12,7 @@ from lerobot.robots.so_follower import SO100Follower, SO100FollowerConfig
 
 
 # ===== CONFIG =====
-MODEL_PATH = str(Path("/Users/kronos.di.vlad/Downloads/2951k-hw2/pretrained_act_model").resolve())
+MODEL_PATH = str(Path("/Users/ziyiwang/Downloads/step_02500").resolve())
 
 PORT1 = "/dev/cu.usbmodem5AE60581371"  # RHS arm named arm1
 PORT2 = "/dev/cu.usbmodem5AE60846081"  # LHS arm named arm2

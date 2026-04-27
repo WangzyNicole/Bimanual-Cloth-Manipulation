@@ -13,8 +13,8 @@ Schema (one row per timestep):
   ...
 
 Usage:
-  python record_demo.py --port /dev/ttyACM0 --out data/demo.parquet
-  python record_demo.py --port /dev/ttyACM0 --port1 /dev/ttyACM1 \
+  python record_demo_camera.py --port /dev/ttyACM0 --out data/demo.parquet
+  python record_demo_camera.py --port /dev/ttyACM0 --port1 /dev/ttyACM1 \
                         --cams 0 1 --out data/demo.parquet
 """
 
@@ -76,15 +76,23 @@ def get_key():
 # ── camera manager ────────────────────────────────────────────────────────────
 
 class CameraManager:
-    """Captures frames from N cameras in a background thread."""
+    """
+    Captures frames from N cameras, each in its own background thread.
+
+    One thread per camera means a stalled or slow USB camera cannot block
+    the others — each camera runs its read() loop independently.
+    """
 
     def __init__(self, cam_ids: list[int], hz: int, resolution=(640, 480)):
+        self.cam_ids    = cam_ids
         self.interval   = 1.0 / hz
         self.resolution = resolution
         self._lock      = threading.Lock()
         self._latest    = {}          # cam_id → latest ndarray
+        self._stale     = {}          # cam_id → consecutive missed frames
         self._stop      = threading.Event()
         self.caps       = {}
+        self._threads   = []
 
         for cid in cam_ids:
             cap = cv2.VideoCapture(cid)
@@ -93,17 +101,22 @@ class CameraManager:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  resolution[0])
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            self.caps[cid]    = cap
+            self.caps[cid]   = cap
             self._latest[cid] = None
+            self._stale[cid]  = 0
 
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        for cid in cam_ids:
+            t = threading.Thread(target=self._loop, args=(cid,), daemon=True)
+            self._threads.append(t)
 
     def start(self):
-        self._thread.start()
+        for t in self._threads:
+            t.start()
 
     def stop(self):
         self._stop.set()
-        self._thread.join(timeout=3)
+        for t in self._threads:
+            t.join(timeout=3)
         for cap in self.caps.values():
             cap.release()
 
@@ -117,16 +130,22 @@ class CameraManager:
                                [cv2.IMWRITE_JPEG_QUALITY, quality])
         return buf.tobytes() if ok else None
 
-    def _loop(self):
+    def stale_count(self, cam_id: int) -> int:
+        """How many consecutive frames this camera has failed to deliver."""
+        with self._lock:
+            return self._stale.get(cam_id, 0)
+
+    def _loop(self, cid: int):
+        cap = self.caps[cid]
         while not self._stop.is_set():
             t0 = time.time()
-            frames = {}
-            for cid, cap in self.caps.items():
-                ok, frame = cap.read()
-                if ok:
-                    frames[cid] = frame
+            ok, frame = cap.read()
             with self._lock:
-                self._latest.update(frames)
+                if ok:
+                    self._latest[cid] = frame
+                    self._stale[cid]  = 0
+                else:
+                    self._stale[cid] += 1
             elapsed = time.time() - t0
             time.sleep(max(0, self.interval - elapsed))
 
@@ -139,8 +158,8 @@ def main():
                         help="Arm 1 serial port")
     parser.add_argument("--port1",      default=None,
                         help="Arm 2 serial port (bimanual)")
-    parser.add_argument("--out",        default="data/demo.parquet",
-                        help="Output Parquet file path")
+    parser.add_argument("--out",        default="dataset/data/chunk-000",
+                        help="Output chunk directory (episode number auto-incremented)")
     parser.add_argument("--hz",         type=int, default=20,
                         help="Capture rate in Hz (default 20)")
     parser.add_argument("--cams",       type=int, nargs="+", default=[0],
@@ -151,9 +170,12 @@ def main():
                         help="JPEG compression quality 1-100 (default 90)")
     args = parser.parse_args()
 
-    out_path   = Path(args.out)
+    chunk_dir  = Path(args.out)
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    existing   = sorted(chunk_dir.glob("episode_*"))
+    next_ep    = int(existing[-1].stem.split("_")[-1]) + 1 if existing else 0
+    out_path   = chunk_dir / f"episode_{next_ep:06d}.parquet"
     resolution = tuple(args.resolution)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # metadata folder sits parallel to the data folder
     meta_dir  = out_path.parent.parent / "metadata"
@@ -197,6 +219,14 @@ def main():
     cam_mgr = CameraManager(args.cams, hz=args.hz, resolution=resolution)
     cam_mgr.start()
 
+    # Warm up cameras — give them a moment to deliver their first frame
+    # before recording starts so we don't log None for the first few rows.
+    print("  Warming up cameras ", end="", flush=True)
+    for _ in range(20):
+        time.sleep(0.05)
+        print(".", end="", flush=True)
+    print(" ready")
+
     print(f"""
 ═══════════════════════════════════════════
   SO-101 Demo Recorder  →  Parquet
@@ -210,11 +240,11 @@ def main():
 """)
 
     # ── state ──
-    recording   = False
-    stop_flag   = threading.Event()
-    episode     = 0
-    rows        = []          # buffer for current episode
-    episode_stats = []        # metadata per episode
+    recording     = False
+    stop_flag     = threading.Event()
+    episode       = 0
+    rows          = []          # buffer for current episode
+    episode_stats = []          # metadata per episode
 
     # open Parquet writer (append-friendly via ParquetWriter)
     pq_writer = pq.ParquetWriter(out_path, schema, compression="snappy")
@@ -244,13 +274,26 @@ def main():
         pq_writer.write_table(table)
 
         duration = round(float(col_data["t"][-1]), 4) if col_data["t"] else 0
+        n_frames = len(episode_rows)
+        actual_hz = round(n_frames / duration, 1) if duration > 0 else 0
+
+        # Per-camera stale frame count
+        cam_missing = {}
+        for col in cam_cols:
+            cam_missing[col] = sum(1 for v in col_data[col] if v is None)
+
         episode_stats.append({
             "episode":    episode,
-            "n_frames":   len(episode_rows),
+            "n_frames":   n_frames,
             "duration_s": duration,
+            "actual_hz":  actual_hz,
+            "cam_missing": cam_missing,
             "recorded_at": datetime.now().isoformat(),
         })
-        print(f"\n  Episode {episode:03d} written — {len(episode_rows)} rows  ({duration:.2f}s)")
+
+        missing_str = "  ".join(f"{c}: {v} missing" for c, v in cam_missing.items())
+        print(f"\n  Episode {episode:03d} written — {n_frames} rows  "
+              f"({duration:.2f}s  actual {actual_hz} hz)  {missing_str}")
 
     # ── background record loop ──
     def record_loop():
@@ -278,7 +321,16 @@ def main():
 
                 rows.append(row)
                 n = len(rows)
-                print(f"\r  ● recording  {t:.2f}s  {n} frames   ",
+
+                # Show stale warnings inline
+                stale_parts = []
+                for cid in args.cams:
+                    s = cam_mgr.stale_count(cid)
+                    if s > 2:
+                        stale_parts.append(f"cam{cid}:stale({s})")
+                stale_str = "  ⚠ " + " ".join(stale_parts) if stale_parts else ""
+
+                print(f"\r  ● recording  {t:.2f}s  {n} frames{stale_str}   ",
                       end="", flush=True)
             else:
                 t_start = None

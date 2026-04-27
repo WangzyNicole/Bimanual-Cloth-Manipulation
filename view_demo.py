@@ -7,10 +7,12 @@ Usage:
     python view_demo.py --file data/demo.parquet          # summary + first frame
     python view_demo.py --file data/demo.parquet --play   # play back all frames
     python view_demo.py --file data/demo.parquet --episode 1 --play
+    python view_demo.py --file data/demo.parquet --play --speed 0.5
 """
 
 import argparse, sys, time
 import numpy as np
+from pathlib import Path
 
 try:
     import pandas as pd
@@ -32,12 +34,24 @@ def decode_frame(jpeg_bytes) -> np.ndarray | None:
 
 def main():
     parser = argparse.ArgumentParser(description="Inspect demo Parquet file")
-    parser.add_argument("--file",    required=True, help="Path to .parquet file")
+    parser.add_argument("--file",    default=None,
+                        help="Path to .parquet file (default: latest in dataset/)")
     parser.add_argument("--episode", type=int, default=None,
                         help="Episode to view (default: all)")
     parser.add_argument("--play",    action="store_true",
                         help="Play back camera frames in a window")
+    parser.add_argument("--speed",   type=float, default=1.0,
+                        help="Playback speed multiplier (default 1.0, try 0.5 for slow-mo)")
+    parser.add_argument("--tile-width", type=int, default=320,
+                        help="Display width per camera tile in pixels (default 320)")
     args = parser.parse_args()
+
+    if args.file is None:
+        files = sorted(Path("dataset/data").rglob("episode_*.parquet"))
+        if not files:
+            sys.exit("No parquet files found in dataset/data/")
+        args.file = str(files[-1])
+        print(f"  Auto-selected: {args.file}")
 
     # ── load ──
     print(f"\n  Loading {args.file} …")
@@ -87,34 +101,73 @@ def main():
         print("\n  Run with --play to preview frames in a window.\n")
         return
 
-    # ── playback ──
-    print("\n  Playing back …  press q or ESC to quit\n")
-    fps      = 20
-    interval = 1.0 / fps
+    # ── pre-decode all frames ──
+    # Decode JPEG → ndarray up front so the display loop does zero decompression
+    # work and can spend all its time on precise timing.
+    target_w = args.tile_width
+    target_h = target_w * 3 // 4   # assume 4:3 source
+
+    print(f"\n  Pre-decoding {len(df)} frames … ", end="", flush=True)
+    t_decode_start = time.time()
+
+    records = []   # list of (t, episode, display_image)
+    blank   = np.zeros((target_h, target_w, 3), dtype=np.uint8)
 
     for _, row in df.iterrows():
-        t0     = time.time()
-        tiles  = []
-
+        tiles = []
         for col in cam_cols:
             frame = decode_frame(row[col])
             if frame is None:
-                frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            # label
-            cv2.putText(frame, f"{col}  t={row['t']:.2f}s  ep{int(row['episode'])}",
-                        (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, (200, 200, 200), 1)
-            tiles.append(frame)
+                tile = blank.copy()
+            else:
+                tile = cv2.resize(frame, (target_w, target_h),
+                                  interpolation=cv2.INTER_LINEAR)
+            # burn label directly into the tile
+            cv2.putText(tile,
+                        f"{col}  t={row['t']:.2f}s  ep{int(row['episode'])}",
+                        (8, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, (200, 200, 200), 1, cv2.LINE_AA)
+            tiles.append(tile)
 
         display = np.hstack(tiles)
-        cv2.imshow("Demo playback  —  q / ESC to quit", display)
+        records.append((float(row["t"]), int(row["episode"]), display))
+
+    print(f"done ({time.time() - t_decode_start:.1f}s)")
+    print(f"  Playing back …  speed={args.speed}x  press q or ESC to quit\n")
+
+    # ── playback loop ──
+    # Instead of sleeping per-frame, we anchor to a wall-clock start time and
+    # compute exactly when each frame should appear. This absorbs any drift from
+    # imshow / waitKey overhead automatically.
+    win = f"Demo: {args.file}  —  q/ESC quit"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+
+    ep_wall_start = time.perf_counter()
+    prev_ep       = records[0][1]
+
+    for t_rec, ep, display in records:
+
+        # Reset wall anchor at episode boundaries so episodes play independently.
+        if ep != prev_ep:
+            ep_wall_start = time.perf_counter()
+            prev_ep = ep
+
+        # When should this frame appear on the wall clock?
+        target_wall = ep_wall_start + t_rec / args.speed
+
+        # Sleep until just before the target, then busy-wait for precision.
+        now = time.perf_counter()
+        sleep_for = target_wall - now - 0.002   # wake 2 ms early
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        while time.perf_counter() < target_wall:
+            pass
+
+        cv2.imshow(win, display)
 
         key = cv2.waitKey(1) & 0xFF
         if key in (ord('q'), 27):
             break
-
-        elapsed = time.time() - t0
-        time.sleep(max(0, interval - elapsed))
 
     cv2.destroyAllWindows()
     print("  Done.")

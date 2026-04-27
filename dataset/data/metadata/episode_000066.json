@@ -1,0 +1,53 @@
+{
+  "session_start": "2026-04-21T11:41:29.423129",
+  "session_end": "2026-04-21T11:42:12.091575",
+  "parquet_file": "dataset/data/chunk-001/episode_000066.parquet",
+  "hz": 20,
+  "resolution": [
+    320,
+    240
+  ],
+  "jpeg_quality": 90,
+  "ports": {
+    "arm1": "/dev/tty.usbmodem5AE60581371",
+    "arm2": "/dev/tty.usbmodem5AE60846081"
+  },
+  "cameras": [
+    0,
+    1
+  ],
+  "joint_columns": [
+    "arm1_j1",
+    "arm1_j2",
+    "arm1_j3",
+    "arm1_j4",
+    "arm1_j5",
+    "arm1_j6",
+    "arm2_j1",
+    "arm2_j2",
+    "arm2_j3",
+    "arm2_j4",
+    "arm2_j5",
+    "arm2_j6"
+  ],
+  "camera_columns": [
+    "cam0_image",
+    "cam1_image"
+  ],
+  "n_episodes": 1,
+  "total_frames": 68,
+  "size_mb": 2.45,
+  "episodes": [
+    {
+      "episode": 1,
+      "n_frames": 68,
+      "duration_s": 13.882,
+      "actual_hz": 4.9,
+      "cam_missing": {
+        "cam0_image": 0,
+        "cam1_image": 0
+      },
+      "recorded_at": "2026-04-21T11:42:11.529542"
+    }
+  ]
+}

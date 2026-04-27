@@ -1,0 +1,98 @@
+{
+  "codebase_version": "v2.1",
+  "robot_type": "so101_bimanual",
+  "total_episodes": 25,
+  "total_frames": 5541,
+  "total_tasks": 1,
+  "total_videos": 50,
+  "total_chunks": 1,
+  "chunks_size": 25,
+  "fps": 20,
+  "splits": {
+    "train": "0:25"
+  },
+  "data_path": "data/chunk-{chunk_index:03d}/episode_{episode_index:06d}.parquet",
+  "video_path": "videos/chunk-{chunk_index:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+  "features": {
+    "observation.state": {
+      "dtype": "float32",
+      "shape": [
+        12
+      ],
+      "names": [
+        "arm1_j1",
+        "arm1_j2",
+        "arm1_j3",
+        "arm1_j4",
+        "arm1_j5",
+        "arm1_j6",
+        "arm2_j1",
+        "arm2_j2",
+        "arm2_j3",
+        "arm2_j4",
+        "arm2_j5",
+        "arm2_j6"
+      ]
+    },
+    "action": {
+      "dtype": "float32",
+      "shape": [
+        12
+      ],
+      "names": [
+        "arm1_j1",
+        "arm1_j2",
+        "arm1_j3",
+        "arm1_j4",
+        "arm1_j5",
+        "arm1_j6",
+        "arm2_j1",
+        "arm2_j2",
+        "arm2_j3",
+        "arm2_j4",
+        "arm2_j5",
+        "arm2_j6"
+      ]
+    },
+    "observation.images.cam0": {
+      "dtype": "video",
+      "shape": [
+        3,
+        224,
+        224
+      ],
+      "names": [
+        "channel",
+        "height",
+        "width"
+      ],
+      "video_info": {
+        "video.fps": 20,
+        "video.codec": "mp4v",
+        "video.pix_fmt": "yuv420p",
+        "video.is_depth_map": false,
+        "has_audio": false
+      }
+    },
+    "observation.images.cam1": {
+      "dtype": "video",
+      "shape": [
+        3,
+        224,
+        224
+      ],
+      "names": [
+        "channel",
+        "height",
+        "width"
+      ],
+      "video_info": {
+        "video.fps": 20,
+        "video.codec": "mp4v",
+        "video.pix_fmt": "yuv420p",
+        "video.is_depth_map": false,
+        "has_audio": false
+      }
+    }
+  }
+}

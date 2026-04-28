@@ -430,8 +430,8 @@ def main():
             current2_rad = ticks2 * TICKS_TO_RAD
             g1_raw = float(a1_rad[5])
             g2_raw = float(a2_rad[5])
-            a1_rad[5] = apply_gripper_hysteresis(g1_raw, float(current1_rad[5]))
-            a2_rad[5] = apply_gripper_hysteresis(g2_raw, float(current2_rad[5]))
+            # a1_rad[5] = apply_gripper_hysteresis(g1_raw, float(current1_rad[5]))
+            # a2_rad[5] = apply_gripper_hysteresis(g2_raw, float(current2_rad[5]))
 
             # ── radians → ticks, then delta-step in tick space ──
             target1_ticks = a1_rad * RAD_TO_TICKS

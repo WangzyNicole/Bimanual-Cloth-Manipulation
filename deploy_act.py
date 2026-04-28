@@ -1,26 +1,34 @@
 """
-ACT Policy Deployment — Bimanual SO-100  (with trajectory recording)
-====================================================================
-Runs the pretrained ACT model on two SO-100 follower arms with two cameras
-and records every tick to disk so the run can be compared against the
-LeRobot training dataset.
+ACT Policy Deployment — Bimanual SO-100  (ticks I/O, radian model)
+==================================================================
+The ACT policy was trained on data converted via:
+    state_rad = ticks * (pi / 2048)
+(see convert_new_class_data.py + configs/train_act_class170.yaml).
+
+So the model expects radians on its inputs and outputs radians on its action.
+The servos, however, speak raw ticks (PRESENT/GOAL_POSITION).  This script:
+
+    motors  --(ticks)-->  ticks*(pi/2048)  --(radians)-->  ACT  --(radians)-->
+                                                                       |
+                                                                       v
+    motors  <--(ticks)--  action_rad*(2048/pi)  <--------------(radians)
 
 Recording layout (when --record-dir is set):
     <record-dir>/
-        episode_000.parquet      # one row per tick
-        episode_000_cam0.mp4     # 320x240 RGB, args.fps
+        episode_000.parquet    # one row per tick
+        episode_000_cam0.mp4
         episode_000_cam1.mp4
-        meta.json                # run config + joint key order
+        meta.json
 
-Each parquet row contains:
+Each parquet row contains (everything in radians for direct comparability
+to the training dataset, plus raw tick columns for debugging):
     timestamp, step_idx, chunk_remaining,
-    observation.state           (12,)  float32  — concatenated [arm1, arm2] in degrees
-    action.raw                  (12,)  float32  — direct policy output (post-postprocessor)
-    action.applied              (12,)  float32  — what was actually sent to the arms
-    gripper1_raw, gripper2_raw  scalars (raw policy gripper output before hysteresis)
-
-This schema is a strict superset of the LeRobot dataset's
-{observation.state, action} so you can load both into a DataFrame and diff.
+    observation.state        (12,)  float32  radians
+    observation.state_ticks  (12,)  float32  raw servo ticks
+    action.raw               (12,)  float32  policy output in radians
+    action.applied           (12,)  float32  applied target in radians
+    action.applied_ticks     (12,)  float32  what was actually written to the motors
+    gripper1_raw, gripper2_raw       (raw policy gripper output before hysteresis)
 
 Usage:
     python deploy_act.py --model ./pretrained_model --cam0 0 --cam1 1 \\
@@ -32,6 +40,7 @@ Controls:
 
 import argparse
 import json
+import math
 import time
 from collections import deque
 from pathlib import Path
@@ -44,34 +53,44 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from safetensors.torch import load_file
 
-from lerobot.robots.so_follower import SO100Follower, SO100FollowerConfig
+from scservo_sdk import PortHandler, PacketHandler
+
+
+# ── servo constants (FEETECH / SCS protocol) ──────────────────────────────────
+TORQUE_ADDR        = 40
+GOAL_POSITION_ADDR = 42
+PRESENT_ADDR       = 56
+
+TICKS_TO_RAD = math.pi / 2048.0     # must match convert_new_class_data.py
+RAD_TO_TICKS = 2048.0 / math.pi
+TICK_MIN, TICK_MAX = 0, 4095
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Deploy ACT policy on bimanual SO-100")
+    parser = argparse.ArgumentParser(
+        description="Deploy ACT policy on bimanual SO-100 (ticks ↔ radians)")
     parser.add_argument("--model",      default="./pretrained_model")
-    parser.add_argument("--port1",      default="/dev/tty.usbmodem5AE60581371")
-    parser.add_argument("--port2",      default="/dev/tty.usbmodem5AE60846081")
+    parser.add_argument("--port1",      default="/dev/tty.usbmodem5AE60581371",
+                        help="Serial port for arm1 (RHS)")
+    parser.add_argument("--port2",      default="/dev/tty.usbmodem5AE60846081",
+                        help="Serial port for arm2 (LHS)")
     parser.add_argument("--cam0",       type=int, default=0)
     parser.add_argument("--cam1",       type=int, default=1)
     parser.add_argument("--fps",        type=int, default=20)
     parser.add_argument("--step-scale", type=float, default=0.5,
-                        help="Fraction of delta to apply per tick (default 0.5)")
-    parser.add_argument("--max-step",   type=float, default=2.0,
-                        help="Max degrees per joint per tick (default 2.0)")
+                        help="Fraction of (target-current) delta to apply per loop")
+    parser.add_argument("--max-step",   type=int,   default=50,
+                        help="Max ticks per joint per loop (default 50 ≈ 0.077 rad)")
     parser.add_argument("--show-cameras", action="store_true")
-    parser.add_argument("--calibration-dir", type=Path, default=Path("."))
 
     # Recording
-    parser.add_argument("--record-dir", type=Path, default=None,
+    parser.add_argument("--record-dir",   type=Path, default=None,
                         help="If set, record trajectory + camera video into this dir.")
-    parser.add_argument("--episode-idx", type=int, default=0,
-                        help="Episode index used in output filenames.")
-    parser.add_argument("--no-record-video", action="store_true",
-                        help="Disable MP4 recording; still write parquet.")
-    parser.add_argument("--print-every", type=int, default=20)
+    parser.add_argument("--episode-idx",  type=int, default=0)
+    parser.add_argument("--no-record-video", action="store_true")
+    parser.add_argument("--print-every",  type=int, default=20)
     return parser.parse_args()
 
 
@@ -113,6 +132,37 @@ def load_act_policy(model_path: str, device: str):
     return policy, preprocessor, postprocessor
 
 
+# ── motor I/O (raw ticks via scservo_sdk) ────────────────────────────────────
+
+def open_port(name: str) -> PortHandler:
+    p = PortHandler(name)
+    if not p.openPort():
+        raise RuntimeError(f"Cannot open port: {name}")
+    p.setBaudRate(1_000_000)
+    return p
+
+
+def set_torque(ph: PacketHandler, port: PortHandler, on: bool):
+    for sid in range(1, 7):
+        ph.write1ByteTxRx(port, sid, TORQUE_ADDR, 1 if on else 0)
+
+
+def read_ticks(ph: PacketHandler, port: PortHandler, last: np.ndarray) -> np.ndarray:
+    """Read present positions for servo IDs 1..6.  On comm error, hold `last`."""
+    out = np.empty(6, dtype=np.float32)
+    for sid in range(1, 7):
+        v, comm, _ = ph.read2ByteTxRx(port, sid, PRESENT_ADDR)
+        out[sid - 1] = float(v) if comm == 0 else float(last[sid - 1])
+    return out
+
+
+def write_ticks(ph: PacketHandler, port: PortHandler, ticks: np.ndarray):
+    """Write goal positions for servo IDs 1..6, clamped to [0, 4095]."""
+    for sid in range(1, 7):
+        t = int(np.clip(ticks[sid - 1], TICK_MIN, TICK_MAX))
+        ph.write2ByteTxRx(port, sid, GOAL_POSITION_ADDR, t)
+
+
 # ── camera helpers ────────────────────────────────────────────────────────────
 
 CAM_H, CAM_W = 240, 320
@@ -146,56 +196,34 @@ def read_camera_tensor(cap: cv2.VideoCapture) -> torch.Tensor:
     return torch.from_numpy(frame).permute(2, 0, 1).float()
 
 
-# ── gripper hysteresis ────────────────────────────────────────────────────────
-
-GRIPPER_OPEN_THRESHOLD  = 3.5
-GRIPPER_CLOSE_THRESHOLD = 2.3
-GRIPPER_OPEN_POS        = 4.5
-GRIPPER_CLOSE_POS       = 2.0
-
-
-def apply_gripper_hysteresis(action_val: float, current_val: float) -> float:
-    if action_val > GRIPPER_OPEN_THRESHOLD:
-        return GRIPPER_OPEN_POS
-    elif action_val < GRIPPER_CLOSE_THRESHOLD:
-        return GRIPPER_CLOSE_POS
-    else:
-        return current_val
+# ── gripper hysteresis (operates in RADIAN space — same as model output) ─────
+# Gripper joint range in ticks is ~1425–2913, i.e. ~2.19–4.47 rad.
+GRIPPER_OPEN_THRESH_RAD  = 3.5
+GRIPPER_CLOSE_THRESH_RAD = 2.3
+GRIPPER_OPEN_POS_RAD     = 4.5
+GRIPPER_CLOSE_POS_RAD    = 2.0
 
 
-# ── incremental target builder ────────────────────────────────────────────────
-
-def build_target(joint_keys, current, action, step_scale, max_step):
-    delta = action - current
-    step  = np.clip(delta * step_scale, -max_step, max_step)
-    target = {}
-    for i, k in enumerate(joint_keys):
-        if "gripper" in k:
-            target[k] = apply_gripper_hysteresis(action[i], current[i])
-        else:
-            target[k] = float(current[i] + step[i])
-    return target
+def apply_gripper_hysteresis(action_rad: float, current_rad: float) -> float:
+    if action_rad > GRIPPER_OPEN_THRESH_RAD:
+        return GRIPPER_OPEN_POS_RAD
+    if action_rad < GRIPPER_CLOSE_THRESH_RAD:
+        return GRIPPER_CLOSE_POS_RAD
+    return current_rad
 
 
 # ── trajectory recorder ───────────────────────────────────────────────────────
 
 class TrajectoryRecorder:
-    """
-    Buffers per-tick rows in memory and flushes to a parquet file on close().
-    Also writes one MP4 per camera if record_video=True.
-
-    The schema mirrors LeRobot's dataset columns where it overlaps:
-        observation.state, action  (both as fixed-length float32 lists)
-    plus extra deployment-only fields for diagnostics.
-    """
+    """Buffers per-tick rows in memory and flushes to a parquet file on close()."""
 
     def __init__(self, out_dir: Path, episode_idx: int, fps: int,
-                 joint_keys1, joint_keys2, record_video: bool):
+                 joint_keys, record_video: bool):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.episode_idx = episode_idx
         self.fps = fps
-        self.joint_keys = list(joint_keys1) + list(joint_keys2)
+        self.joint_keys = list(joint_keys)
         self.record_video = record_video
 
         self.rows = []
@@ -213,23 +241,26 @@ class TrajectoryRecorder:
             "episode_idx": episode_idx,
             "fps": fps,
             "joint_keys": self.joint_keys,
+            "ticks_to_rad": TICKS_TO_RAD,
             "schema": {
-                "observation.state": f"float32[{len(self.joint_keys)}]",
-                "action.raw":        f"float32[{len(self.joint_keys)}]",
-                "action.applied":    f"float32[{len(self.joint_keys)}]",
+                "observation.state":       "float32[12]  radians",
+                "observation.state_ticks": "float32[12]  raw servo ticks",
+                "action.raw":              "float32[12]  radians (policy output)",
+                "action.applied":          "float32[12]  radians (commanded)",
+                "action.applied_ticks":    "float32[12]  ticks  (written to motors)",
             },
             "notes": (
-                "action.raw is the direct policy output AFTER postprocessing. "
-                "action.applied is what was sent to the arms (after delta-stepping "
-                "and gripper hysteresis). Compare action.raw against the training "
-                "dataset's `action` column; compare observation.state against the "
-                "training dataset's `observation.state`."
+                "All radian columns are directly comparable to the training "
+                "dataset's `observation.state` / `action` columns "
+                "(ticks * pi/2048).  observation.state_ticks and "
+                "action.applied_ticks are the raw servo-side values."
             ),
         }
         with open(self.out_dir / "meta.json", "w") as f:
             json.dump(meta, f, indent=2)
 
-    def log(self, *, step_idx, state, action_raw, action_applied,
+    def log(self, *, step_idx, state_rad, state_ticks,
+            action_raw_rad, action_applied_rad, action_applied_ticks,
             gripper1_raw, gripper2_raw, chunk_remaining,
             cam0_frame=None, cam1_frame=None):
         if self.t_start is None:
@@ -237,14 +268,16 @@ class TrajectoryRecorder:
         ts = time.time() - self.t_start
 
         self.rows.append({
-            "timestamp":         float(ts),
-            "step_idx":          int(step_idx),
-            "chunk_remaining":   int(chunk_remaining),
-            "observation.state": np.asarray(state, dtype=np.float32).tolist(),
-            "action.raw":        np.asarray(action_raw, dtype=np.float32).tolist(),
-            "action.applied":    np.asarray(action_applied, dtype=np.float32).tolist(),
-            "gripper1_raw":      float(gripper1_raw),
-            "gripper2_raw":      float(gripper2_raw),
+            "timestamp":               float(ts),
+            "step_idx":                int(step_idx),
+            "chunk_remaining":         int(chunk_remaining),
+            "observation.state":       np.asarray(state_rad,             dtype=np.float32).tolist(),
+            "observation.state_ticks": np.asarray(state_ticks,           dtype=np.float32).tolist(),
+            "action.raw":              np.asarray(action_raw_rad,        dtype=np.float32).tolist(),
+            "action.applied":          np.asarray(action_applied_rad,    dtype=np.float32).tolist(),
+            "action.applied_ticks":    np.asarray(action_applied_ticks,  dtype=np.float32).tolist(),
+            "gripper1_raw":            float(gripper1_raw),
+            "gripper2_raw":            float(gripper2_raw),
         })
 
         if self.record_video:
@@ -271,19 +304,17 @@ class TrajectoryRecorder:
             df.to_parquet(out_path, index=False)
             print(f"Recorder: wrote {len(df)} rows -> {out_path}")
         except Exception as e:
-            # Fallback to npz if pandas/pyarrow unavailable
             fallback = self.out_dir / f"episode_{self.episode_idx:03d}.npz"
             print(f"Recorder: parquet write failed ({e}); saving npz instead.")
             np.savez(
                 fallback,
                 timestamp=np.array([r["timestamp"] for r in self.rows], dtype=np.float32),
                 step_idx=np.array([r["step_idx"] for r in self.rows], dtype=np.int64),
-                state=np.stack([np.array(r["observation.state"], dtype=np.float32)
-                                for r in self.rows]),
-                action_raw=np.stack([np.array(r["action.raw"], dtype=np.float32)
-                                     for r in self.rows]),
-                action_applied=np.stack([np.array(r["action.applied"], dtype=np.float32)
-                                         for r in self.rows]),
+                state=np.stack([np.array(r["observation.state"],          dtype=np.float32) for r in self.rows]),
+                state_ticks=np.stack([np.array(r["observation.state_ticks"], dtype=np.float32) for r in self.rows]),
+                action_raw=np.stack([np.array(r["action.raw"],            dtype=np.float32) for r in self.rows]),
+                action_applied=np.stack([np.array(r["action.applied"],    dtype=np.float32) for r in self.rows]),
+                action_applied_ticks=np.stack([np.array(r["action.applied_ticks"], dtype=np.float32) for r in self.rows]),
                 gripper1_raw=np.array([r["gripper1_raw"] for r in self.rows], dtype=np.float32),
                 gripper2_raw=np.array([r["gripper2_raw"] for r in self.rows], dtype=np.float32),
             )
@@ -298,39 +329,37 @@ def main():
 
     policy, preprocessor, postprocessor = load_act_policy(args.model, device)
 
-    robot1 = SO100Follower(SO100FollowerConfig(
-        port=args.port1, id="arm1", use_degrees=True,
-        calibration_dir=args.calibration_dir))
-    robot2 = SO100Follower(SO100FollowerConfig(
-        port=args.port2, id="arm2", use_degrees=True,
-        calibration_dir=args.calibration_dir))
-
-    print("Connecting robots...")
-    robot1.connect()
-    robot2.connect()
-    print("Connected.")
-
-    obs1 = robot1.get_observation()
-    obs2 = robot2.get_observation()
-    joint_keys1 = [k for k in obs1 if k.endswith(".pos")]
-    joint_keys2 = [k for k in obs2 if k.endswith(".pos")]
-    print("arm1 joints:", joint_keys1)
-    print("arm2 joints:", joint_keys2)
+    # Open both arm ports — talk to servos in raw ticks (no degree conversion).
+    ph    = PacketHandler(0)
+    print(f"Opening arm ports:  arm1={args.port1}  arm2={args.port2}")
+    port1 = open_port(args.port1)
+    port2 = open_port(args.port2)
+    set_torque(ph, port1, True)
+    set_torque(ph, port2, True)
+    print("Torque enabled on both arms.")
 
     print(f"Opening cameras (cam0={args.cam0}, cam1={args.cam1})...")
     cap0 = open_camera(args.cam0)
     cap1 = open_camera(args.cam1)
-    print(f"Cameras ready. step_scale={args.step_scale} max_step={args.max_step}")
+    print(f"Cameras ready. step_scale={args.step_scale}  max_step={args.max_step} ticks")
 
-    # Recorder
+    # Joint order: arm1_j1..j6 then arm2_j1..j6 — matches the training data.
+    joint_keys = (
+        [f"arm1_j{i}" for i in range(1, 7)] +
+        [f"arm2_j{i}" for i in range(1, 7)]
+    )
+
+    # Initial state read — fall back to mid-tick if the bus stutters.
+    ticks1 = read_ticks(ph, port1, np.full(6, 2048.0, dtype=np.float32))
+    ticks2 = read_ticks(ph, port2, np.full(6, 2048.0, dtype=np.float32))
+
     recorder = None
     if args.record_dir is not None:
         recorder = TrajectoryRecorder(
             out_dir=args.record_dir,
             episode_idx=args.episode_idx,
             fps=args.fps,
-            joint_keys1=joint_keys1,
-            joint_keys2=joint_keys2,
+            joint_keys=joint_keys,
             record_video=not args.no_record_video,
         )
         print(f"Recording to {args.record_dir} (episode {args.episode_idx:03d})")
@@ -339,22 +368,21 @@ def main():
     chunk_size   = 10
     step_idx     = 0
 
-    print(f"\nRunning at {args.fps} fps. Press Ctrl-C to stop.\n")
+    print(f"\nRunning at {args.fps} fps.  Ctrl-C to stop.\n")
 
     try:
         while True:
             t0 = time.time()
 
-            obs1 = robot1.get_observation()
-            obs2 = robot2.get_observation()
-            current1 = np.array([obs1[k] for k in joint_keys1], dtype=np.float32)
-            current2 = np.array([obs2[k] for k in joint_keys2], dtype=np.float32)
-            state = np.concatenate([current1, current2])
+            # ── read joint state (ticks) ──
+            ticks1 = read_ticks(ph, port1, ticks1)
+            ticks2 = read_ticks(ph, port2, ticks2)
+            state_ticks = np.concatenate([ticks1, ticks2]).astype(np.float32)
+            state_rad   = state_ticks * TICKS_TO_RAD          # → radians for the model
 
+            # ── cameras ──
             cam0_t = read_camera_tensor(cap0)
             cam1_t = read_camera_tensor(cap1)
-
-            # Keep a uint8 RGB copy for video recording / preview
             cam0_rgb = cam0_t.permute(1, 2, 0).numpy().astype(np.uint8)
             cam1_rgb = cam1_t.permute(1, 2, 0).numpy().astype(np.uint8)
 
@@ -369,11 +397,12 @@ def main():
                 if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
                     break
 
+            # ── inference (radians in, radians out) ──
             if not action_chunk:
                 obs = {
                     "observation.images.cam0": cam0_t,
                     "observation.images.cam1": cam1_t,
-                    "observation.state": torch.from_numpy(state),
+                    "observation.state":       torch.from_numpy(state_rad),
                 }
                 with torch.no_grad():
                     policy_input  = preprocessor(obs)
@@ -392,31 +421,47 @@ def main():
                 for a in actions_raw[:chunk_size]:
                     action_chunk.append(a)
 
-            action  = action_chunk.popleft()
-            action1 = action[:6]
-            action2 = action[6:]
+            action_rad = action_chunk.popleft().astype(np.float32)   # 12-D, radians
+            a1_rad = action_rad[:6].copy()
+            a2_rad = action_rad[6:].copy()
 
-            target1 = build_target(joint_keys1, current1, action1,
-                                   args.step_scale, args.max_step)
-            target2 = build_target(joint_keys2, current2, action2,
-                                   args.step_scale, args.max_step)
+            # ── gripper hysteresis (radian space) ──
+            current1_rad = ticks1 * TICKS_TO_RAD
+            current2_rad = ticks2 * TICKS_TO_RAD
+            g1_raw = float(a1_rad[5])
+            g2_raw = float(a2_rad[5])
+            a1_rad[5] = apply_gripper_hysteresis(g1_raw, float(current1_rad[5]))
+            a2_rad[5] = apply_gripper_hysteresis(g2_raw, float(current2_rad[5]))
 
-            robot1.send_action(target1)
-            robot2.send_action(target2)
+            # ── radians → ticks, then delta-step in tick space ──
+            target1_ticks = a1_rad * RAD_TO_TICKS
+            target2_ticks = a2_rad * RAD_TO_TICKS
 
-            # Build the "applied" vector in the same joint order as state
-            applied1 = np.array([target1[k] for k in joint_keys1], dtype=np.float32)
-            applied2 = np.array([target2[k] for k in joint_keys2], dtype=np.float32)
-            action_applied = np.concatenate([applied1, applied2])
+            delta1 = target1_ticks - ticks1
+            delta2 = target2_ticks - ticks2
+            step1  = np.clip(delta1 * args.step_scale, -args.max_step, args.max_step)
+            step2  = np.clip(delta2 * args.step_scale, -args.max_step, args.max_step)
+            applied1_ticks = ticks1 + step1
+            applied2_ticks = ticks2 + step2
+
+            # ── write to motors ──
+            write_ticks(ph, port1, applied1_ticks)
+            write_ticks(ph, port2, applied2_ticks)
+
+            # bookkeeping for the recorder (everything in radians for comparability)
+            applied_ticks = np.concatenate([applied1_ticks, applied2_ticks]).astype(np.float32)
+            applied_rad   = applied_ticks * TICKS_TO_RAD
 
             if recorder is not None:
                 recorder.log(
                     step_idx=step_idx,
-                    state=state,
-                    action_raw=np.asarray(action, dtype=np.float32),
-                    action_applied=action_applied,
-                    gripper1_raw=float(action1[-1]),
-                    gripper2_raw=float(action2[-1]),
+                    state_rad=state_rad,
+                    state_ticks=state_ticks,
+                    action_raw_rad=action_rad,
+                    action_applied_rad=applied_rad,
+                    action_applied_ticks=applied_ticks,
+                    gripper1_raw=g1_raw,
+                    gripper2_raw=g2_raw,
                     chunk_remaining=len(action_chunk),
                     cam0_frame=cam0_rgb,
                     cam1_frame=cam1_rgb,
@@ -424,17 +469,16 @@ def main():
 
             if step_idx % args.print_every == 0:
                 print(f"[step {step_idx:05d}]  chunk_remaining={len(action_chunk)}")
-                print(f"  arm1  cur: {np.round(current1, 2)}")
-                print(f"  arm1  raw: {np.round(action1,  2)}")
-                print(f"  arm1  app: {np.round(applied1, 2)}")
-                print(f"  arm2  cur: {np.round(current2, 2)}")
-                print(f"  arm2  raw: {np.round(action2,  2)}")
-                print(f"  arm2  app: {np.round(applied2, 2)}")
-                print(f"  gripper1 raw: {action1[-1]:.3f}  cmd: {target1['gripper.pos']:.2f}")
-                print(f"  gripper2 raw: {action2[-1]:.3f}  cmd: {target2['gripper.pos']:.2f}")
+                print(f"  arm1 cur ticks: {ticks1.astype(int)}")
+                print(f"  arm1 raw rad  : {np.round(action_rad[:6], 3)}")
+                print(f"  arm1 applied  : {applied1_ticks.astype(int)}")
+                print(f"  arm2 cur ticks: {ticks2.astype(int)}")
+                print(f"  arm2 raw rad  : {np.round(action_rad[6:], 3)}")
+                print(f"  arm2 applied  : {applied2_ticks.astype(int)}")
+                print(f"  gripper1 raw rad: {g1_raw:.3f}  cmd ticks: {int(applied1_ticks[5])}")
+                print(f"  gripper2 raw rad: {g2_raw:.3f}  cmd ticks: {int(applied2_ticks[5])}")
 
             step_idx += 1
-
             dt = time.time() - t0
             time.sleep(max(1.0 / args.fps - dt, 0))
 
@@ -442,7 +486,7 @@ def main():
         print("\nStopped by user.")
 
     finally:
-        print("Releasing torque and disconnecting...")
+        print("Releasing torque and closing ports...")
         if recorder is not None:
             recorder.close()
         cap0.release()
@@ -450,8 +494,10 @@ def main():
         if args.show_cameras:
             cv2.destroyAllWindows()
         try:
-            robot1.disconnect()
-            robot2.disconnect()
+            set_torque(ph, port1, False)
+            set_torque(ph, port2, False)
+            port1.closePort()
+            port2.closePort()
         except Exception:
             pass
         print("Done.")
